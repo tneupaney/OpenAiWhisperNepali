@@ -1,5 +1,7 @@
 # Mac file
 .DS_Store
+venv_whisper_nepali
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
