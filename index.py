@@ -1,157 +1,207 @@
 import os
-from datasets import load_dataset, Audio
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
+from datasets import load_dataset, Audio, Value
+from transformers import WhisperProcessor, WhisperForConditionalGeneration, Seq2SeqTrainingArguments, Seq2SeqTrainer, pipeline
 import torch
+import evaluate
+from dataclasses import dataclass
+from typing import Any, Dict, List, Union
 
 # --- Configuration ---
-# Adjust these paths to your specific download location
-common_voice_dir = "mozilla/ne" # IMPORTANT: Update this path!
+script_dir = os.path.dirname(os.path.abspath(__file__))
+common_voice_dir = os.path.join(script_dir, "mozilla", "ne")
 audio_base_path = os.path.join(common_voice_dir, "clips")
-
-# Choose your Whisper model size
 model_name = "openai/whisper-small"
 
-# --- 1. Load Pre-trained Whisper Model and Processor ---
-# Specify language 'ne' for Nepali and task 'transcribe'
+print(f"Loading Whisper processor and model: {model_name}")
 processor = WhisperProcessor.from_pretrained(model_name, language="ne", task="transcribe")
 model = WhisperForConditionalGeneration.from_pretrained(model_name)
 
 if torch.cuda.is_available():
+    print("CUDA is available. Moving model to GPU.")
     model = model.to("cuda")
+else:
+    print("CUDA not available. Model will run on CPU.")
 
-# --- 2. Load Common Voice Dataset from Local TSV files ---
-# Common Voice TSV files have 'path' (for audio filename) and 'sentence' (for transcription)
-# We will use 'train.tsv' for training and 'dev.tsv' for validation/testing.
-# You might want to use 'validated.tsv' for a more robust validation set if available and larger.
-
+# --- Load dataset ---
 train_tsv_path = os.path.join(common_voice_dir, "train.tsv")
 dev_tsv_path = os.path.join(common_voice_dir, "dev.tsv")
-# test_tsv_path = os.path.join(common_voice_dir, "test.tsv") # If you want a separate test set
-
-# Create a dictionary pointing to your TSV files
 data_files = {
     "train": train_tsv_path,
-    "validation": dev_tsv_path, # Using dev.tsv as validation
-    # "test": test_tsv_path # Uncomment if you have a separate test.tsv
+    "validation": dev_tsv_path
 }
 
-# Load the dataset. Common Voice TSV typically uses '\t' as delimiter.
-# Set `delimiter` if not default. `column_names` to map to 'audio' and 'sentence'.
-# IMPORTANT: The 'path' column in Common Voice TSV contains just the filename (e.g., "common_voice_ne_123456.mp3").
-# We need to prepend the `audio_base_path` to create full paths.
-dataset = load_dataset(
-    "csv",
-    data_files=data_files,
-    delimiter="\t", # Common Voice uses tab-separated values
-    column_names=["client_id", "path", "sentence", "up_votes", "down_votes", "age", "gender", "accent", "locale", "segment"],
-    skiprows=1 # Skip header row
-)
+try:
+    dataset = load_dataset(
+        "csv",
+        data_files=data_files,
+        delimiter="\t",
+        column_names=["client_id", "path", "sentence", "up_votes", "down_votes", "age", "gender", "accent", "locale", "segment"],
+        skiprows=1
+    )
+except FileNotFoundError as e:
+    print(f"Error: Could not find Common Voice TSV files. Please ensure the path '{common_voice_dir}' is correct and contains 'train.tsv' and 'dev.tsv'.")
+    print(f"Details: {e}")
+    exit()
 
-# Filter out rows where 'sentence' is empty or NaN
-dataset = dataset.filter(lambda example: example["sentence"] is not None and example["sentence"].strip() != "")
+print("Dataset loaded successfully.")
+print("Initial columns:", dataset["train"].column_names)
 
-# Construct full audio paths. The `path` column in Common Voice TSV is just the filename.
-def add_audio_path_prefix(batch, audio_dir):
-    batch["audio_path"] = os.path.join(audio_dir, batch["path"])
-    return batch
+# --- Filter logic per split ---
+# Cast 'sentence' to string first
+dataset = dataset.cast_column("sentence", Value("string"))
 
-dataset = dataset.map(
-    lambda batch: add_audio_path_prefix(batch, audio_base_path),
-    remove_columns=["path"], # Remove the relative 'path' column
-    num_proc=os.cpu_count() # Use all CPU cores for this
-)
+for split in ["train", "validation"]:
+    # Filter out rows where 'sentence' is None or effectively empty after stripping whitespace
+    dataset[split] = dataset[split].filter(
+        lambda x: x["sentence"] is not None and len(x["sentence"].strip()) > 0,
+        load_from_cache_file=False
+    )
+    # Filter out rows where 'path' is None or effectively empty after stripping whitespace
+    dataset[split] = dataset[split].filter(
+        lambda x: x["path"] is not None and len(str(x["path"]).strip()) > 0,
+        load_from_cache_file=False
+    )
+    print(f"📊 {split.capitalize()} size after filtering:", len(dataset[split]))
+    if len(dataset[split]) > 0:
+        print(f"🔍 Sample row from {split}:", dataset[split][0])
+    else:
+        print(f"⚠️ Warning: {split.capitalize()} dataset is empty after filtering. Check your TSV data.")
 
-# Rename 'audio_path' to 'audio' and 'sentence' to 'text' for compatibility with prepare_dataset
-dataset = dataset.rename_column("audio_path", "audio")
-dataset = dataset.rename_column("sentence", "text")
 
-# Cast the 'audio' column to Audio feature. This will automatically load and resample audio.
-dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
+# --- Add audio_path column and then remove original 'path' ---
+def add_audio_path_column_and_clean(example, audio_dir):
+    # Ensure path is a string, even if it was something else before filtering (though filters should prevent this)
+    audio_filename = str(example["path"])
+    example["audio_path"] = os.path.join(audio_dir, audio_filename)
+    return example
 
-# --- 3. Prepare the dataset for Whisper (same as before) ---
+for split in ["train", "validation"]:
+    if len(dataset[split]) > 0: # Only process if the split is not empty
+        print(f"🚧 Adding audio_path column to {split} set and preparing for removal of 'path'...")
+        # Use map to add 'audio_path'
+        dataset[split] = dataset[split].map(
+            lambda example: add_audio_path_column_and_clean(example, audio_base_path),
+            load_from_cache_file=False,
+            num_proc=os.cpu_count() # Use multiple processes for faster audio path generation
+        )
+        print(f"✅ Columns in {split} after adding audio_path:", dataset[split].column_names)
+
+        # Drop original path and pandas index columns for this split
+        # We need to ensure 'path' is in columns before trying to remove it
+        cols_to_remove = ["path"] + [col for col in dataset[split].column_names if col.startswith("__index_level_")]
+        cols_to_remove = [col for col in cols_to_remove if col in dataset[split].column_names] # Ensure column exists before removal
+
+        print(f"🗑️ Removing columns {cols_to_remove} from {split} set...")
+        dataset[split] = dataset[split].remove_columns(cols_to_remove)
+        print(f"✅ Columns in {split} after removing 'path' and index columns:", dataset[split].column_names)
+    else:
+        print(f"Skipping column operations for empty {split} dataset.")
+
+
+# --- Rename for Whisper compatibility ---
+print("Renaming columns for Whisper compatibility ('audio_path' to 'audio', 'sentence' to 'text')...")
+for split in ["train", "validation"]:
+    if len(dataset[split]) > 0: # Only rename if the split is not empty
+        # Check if 'audio_path' exists before renaming
+        if "audio_path" in dataset[split].column_names:
+            dataset[split] = dataset[split].rename_column("audio_path", "audio")
+        else:
+            print(f"⚠️ Warning: 'audio_path' not found in {split} dataset for renaming. Columns: {dataset[split].column_names}")
+
+        # Check if 'sentence' exists before renaming
+        if "sentence" in dataset[split].column_names:
+            dataset[split] = dataset[split].rename_column("sentence", "text")
+        else:
+            print(f"⚠️ Warning: 'sentence' not found in {split} dataset for renaming. Columns: {dataset[split].column_names}")
+    else:
+        print(f"Skipping renaming for empty {split} dataset.")
+
+
+print("🎯 Final columns (train):", dataset["train"].column_names)
+print("🎯 Final columns (validation):", dataset["validation"].column_names)
+
+
+# --- Cast audio ---
+print("Casting 'audio' column to Audio feature (resampling to 16kHz)...")
+for split in ["train", "validation"]:
+    if len(dataset[split]) > 0 and "audio" in dataset[split].column_names:
+        dataset[split] = dataset[split].cast_column("audio", Audio(sampling_rate=16000))
+    else:
+        print(f"Skipping audio casting for empty or missing 'audio' column in {split} dataset.")
+
+
+# --- Feature extraction ---
 def prepare_dataset(batch):
-    # Load and resample audio data
     audio = batch["audio"]
-
-    # Compute log-mel spectrogram features
+    # Ensure sampling_rate is correct, it should be 16000 after casting
     batch["input_features"] = processor.feature_extractor(audio["array"], sampling_rate=audio["sampling_rate"]).input_features[0]
-
-    # Tokenize target text
-    # The `language` and `task` are implicitly handled by the processor's initialisation
     batch["labels"] = processor.tokenizer(batch["text"]).input_ids
     return batch
 
+print("Preparing dataset (feature extraction and tokenization)...")
 # Apply the preparation function to your dataset
-# Remove original columns to save memory and ensure correct feature handling
-tokenized_dataset = dataset.map(
-    prepare_dataset,
-    remove_columns=dataset.column_names["train"],
-    num_proc=os.cpu_count(), # Use all CPU cores for this
-    desc="Processing dataset audio and text"
-)
+# Remove all original columns after processing to save memory and ensure correct feature handling
+# Only map if the train split is not empty
+if len(dataset["train"]) > 0:
+    tokenized_dataset = dataset.map(
+        prepare_dataset,
+        remove_columns=dataset["train"].column_names,
+        num_proc=os.cpu_count(),
+        desc="Processing dataset audio and text",
+        load_from_cache_file=False
+    )
+else:
+    print("Train dataset is empty after preprocessing. Cannot tokenize.")
+    tokenized_dataset = dataset # Keep the empty dataset structure
 
 # You can inspect a sample to verify the structure
-print(tokenized_dataset["train"][0])
+if len(tokenized_dataset["train"]) > 0:
+    print("\nExample of a tokenized dataset entry:")
+    print(tokenized_dataset["train"][0])
+else:
+    print("\nTokenized train dataset is empty.")
 
-# --- Rest of the fine-tuning code (steps 5-8 from previous answer) remains largely the same ---
 
-# --- 4. Define Data Collator ---
-from dataclasses import dataclass
-from typing import Any, Dict, List, Union
-import torch # Ensure torch is imported here
-
+# --- Data Collator ---
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
     processor: Any
 
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        input_features = [{"input_features": feature["input_features"]} for feature in features]
+        input_features = [{"input_features": f["input_features"]} for f in features]
         batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
 
-        label_features = [{"input_ids": feature["labels"]} for feature in features]
+        label_features = [{"input_ids": f["labels"]} for f in features]
         labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
-
         labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
 
         if (labels[:, 0] == self.processor.tokenizer.bos_token_id).all().item():
             labels = labels[:, 1:]
 
         batch["labels"] = labels
-
         return batch
 
 data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=processor)
 
-
-# --- 5. Define Evaluation Metric (WER) ---
-import evaluate
-
+# --- Evaluation metric ---
 metric = evaluate.load("wer")
 
 def compute_metrics(pred):
     pred_ids = pred.predictions
     label_ids = pred.label_ids
-
     label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
-
     pred_str = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
     label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+    return {"wer": 100 * metric.compute(predictions=pred_str, references=label_str)}
 
-    wer = 100 * metric.compute(predictions=pred_str, references=label_str)
-
-    return {"wer": wer}
-
-
-# --- 6. Configure Training Arguments and Trainer ---
-from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
-
+# --- Training arguments ---
 training_args = Seq2SeqTrainingArguments(
-    output_dir="./whisper-fine-tuned-nepali-cv", # Distinct output directory
+    output_dir="./whisper-fine-tuned-nepali-cv",
     per_device_train_batch_size=16,
     gradient_accumulation_steps=1,
     learning_rate=1e-5,
     warmup_steps=500,
-    max_steps=4000, # Adjust based on dataset size. Common Voice Nepali should have enough data.
+    max_steps=4000,
     gradient_checkpointing=True,
     fp16=True,
     evaluation_strategy="steps",
@@ -168,45 +218,66 @@ training_args = Seq2SeqTrainingArguments(
     push_to_hub=False,
 )
 
-trainer = Seq2SeqTrainer(
-    model=model,
-    args=training_args,
-    train_dataset=tokenized_dataset["train"],
-    eval_dataset=tokenized_dataset["validation"], # Use 'validation' split for evaluation
-    data_collator=data_collator,
-    compute_metrics=compute_metrics,
-    tokenizer=processor.tokenizer,
-)
+# --- Trainer setup ---
+# Only initialize trainer if train_dataset is not empty
+if len(tokenized_dataset["train"]) > 0:
+    trainer = Seq2SeqTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_dataset["train"],
+        eval_dataset=tokenized_dataset["validation"] if len(tokenized_dataset["validation"]) > 0 else None, # Pass None if validation is empty
+        data_collator=data_collator,
+        compute_metrics=compute_metrics,
+        tokenizer=processor.tokenizer,
+    )
+else:
+    print("Cannot initialize trainer: Train dataset is empty.")
+    trainer = None # Set trainer to None if no data to train
 
-# --- 7. Start Training ---
-trainer.train()
+# --- Train ---
+if trainer:
+    print("\n--- Starting Model Training ---")
+    trainer.train()
+    print("--- Model Training Complete ---")
 
-# Save the final model and processor
-processor.save_pretrained("./whisper-fine-tuned-nepali-cv")
-model.save_pretrained("./whisper-fine-tuned-nepali-cv")
+    # Save model ---
+    print("Saving the fine-tuned model and processor...")
+    processor.save_pretrained("./whisper-fine-tuned-nepali-cv")
+    model.save_pretrained("./whisper-fine-tuned-nepali-cv")
+    print("Model saved to ./whisper-fine-tuned-nepali-cv")
+else:
+    print("\n--- Skipping Model Training due to empty dataset ---")
 
-# --- 8. Inference (Testing Your Fine-tuned Model) ---
-# This part is identical to the previous guide, just ensuring it loads from the new path
-print("\n--- Model Training Complete. Starting Inference Test ---")
-from transformers import pipeline
-import torch
-
+# --- Inference Test ---
+print("\n--- Inference Test ---")
 model_path_inference = "./whisper-fine-tuned-nepali-cv"
-pipe = pipeline("automatic-speech-recognition", model=model_path_inference, device=0 if torch.cuda.is_available() else -1)
+# Ensure the model and processor are loaded for inference even if training was skipped
+try:
+    pipe = pipeline("automatic-speech-recognition", model=model_path_inference, device=0 if torch.cuda.is_available() else -1)
+except Exception as e:
+    print(f"Error loading pipeline for inference. Make sure a model was saved: {e}")
+    pipe = None
 
-# Example: Transcribe a sample from your test set or a new audio file
-# For demonstration, let's take an audio from the loaded dataset (if 'test' split exists or use a validation sample)
-# You can also load your own new Nepali audio file for testing.
-if "test" in tokenized_dataset:
-    sample_audio_data = tokenized_dataset["test"][0]["audio"]
-    actual_text = tokenized_dataset["test"][0]["text"]
-else: # If no explicit 'test' split, use a validation sample
-    sample_audio_data = tokenized_dataset["validation"][0]["audio"]
-    actual_text = tokenized_dataset["validation"][0]["text"]
+if pipe:
+    if "test" in dataset and len(dataset["test"]) > 0:
+        sample_entry = dataset["test"][0]
+        print("Using a sample from the 'test' split for inference.")
+    elif len(dataset["validation"]) > 0:
+        sample_entry = dataset["validation"][0]
+        print("Using a sample from the 'validation' split for inference.")
+    else:
+        print("❌ No data available for inference test.")
+        sample_entry = None
 
-# Transcribe using the pipeline
-# The pipeline function can take audio arrays directly
-result = pipe(sample_audio_data["array"], sampling_rate=sample_audio_data["sampling_rate"], generate_kwargs={"language": "ne", "task": "transcribe"})
-
-print(f"\nOriginal Text: {actual_text}")
-print(f"Transcribed Text: {result['text']}")
+    if sample_entry:
+        sample_audio_data = sample_entry["audio"]
+        actual_text = sample_entry["text"]
+        print(f"Transcribing sample audio (original text: '{actual_text}')...")
+        result = pipe(sample_audio_data["array"], sampling_rate=sample_audio_data["sampling_rate"], generate_kwargs={"language": "ne", "task": "transcribe"})
+        print(f"\nOriginal Text: {actual_text}")
+        print(f"Transcribed Text: {result['text']}")
+        print("--- Inference Complete ---")
+    else:
+        print("Skipping inference test as no valid sample entry found.")
+else:
+    print("Skipping inference test as pipeline could not be loaded.")

@@ -1,0 +1,9 @@
+transformers
+datasets
+accelerate
+soundfile
+librosa
+evaluate
+jiwer
+torch
+tensorboard
