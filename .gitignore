@@ -1,3 +1,5 @@
+# Mac file
+.DS_Store
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -74,6 +76,9 @@ docs/_build/
 # PyBuilder
 .pybuilder/
 target/
+
+# Mozilla Common Voice
+mozilla/
 
 # Jupyter Notebook
 .ipynb_checkpoints
