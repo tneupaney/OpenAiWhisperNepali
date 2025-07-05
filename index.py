@@ -16,13 +16,21 @@ from typing import Any, Dict, List, Union
 script_dir = os.path.dirname(os.path.abspath(__file__))
 common_voice_dir = os.path.join(script_dir, "mozilla", "ne")
 audio_base_path = os.path.join(common_voice_dir, "clips")
-model_name = "openai/whisper-small"
+model_name = "openai/whisper-base" # CHANGED: Using a smaller model to reduce memory usage
 
 # --- 1. Load Pre-trained Whisper Model and Processor ---
 processor = WhisperProcessor.from_pretrained(model_name, language="ne", task="transcribe")
 model = WhisperForConditionalGeneration.from_pretrained(model_name)
-if torch.cuda.is_available():
+
+# Move model to MPS device for Apple Silicon acceleration if available
+if torch.backends.mps.is_available():
+    model = model.to("mps")
+    print("MPS is available. Model moved to MPS device for Apple Silicon acceleration.")
+elif torch.cuda.is_available(): # Fallback for NVIDIA CUDA, though unlikely on your Mac
     model = model.to("cuda")
+    print("CUDA is available. Model moved to GPU.")
+else:
+    print("No GPU acceleration (CUDA/MPS) available. Model will run on CPU.")
 
 # --- 2. Load Common Voice Dataset from Local TSV files ---
 train_tsv_path = os.path.join(common_voice_dir, "train.tsv")
@@ -139,15 +147,15 @@ def compute_metrics(pred):
 # --- 6. Configure Training Arguments and Trainer ---
 training_args = Seq2SeqTrainingArguments(
     output_dir="./whisper-fine-tuned-nepali-cv",
-    per_device_train_batch_size=16,
-    gradient_accumulation_steps=1,
+    per_device_train_batch_size=2, # Keep at 2 for now
+    gradient_accumulation_steps=8, # Keep at 8 for now
     learning_rate=1e-5,
     warmup_steps=500,
     max_steps=4000,
-    gradient_checkpointing=True,
-    fp16=True,
-    evaluation_strategy="steps",
-    per_device_eval_batch_size=8,
+    gradient_checkpointing=False, # Keep False
+    fp16=False, # Keep False
+    eval_strategy="steps",
+    per_device_eval_batch_size=2, # Keep at 2 for now
     predict_with_generate=True,
     generation_max_length=225,
     save_steps=1000,
@@ -158,6 +166,9 @@ training_args = Seq2SeqTrainingArguments(
     metric_for_best_model="wer",
     greater_is_better=False,
     push_to_hub=False,
+    # Added to potentially help with MPS memory management, though often not needed
+    # when batch size is small enough.
+    # dataloader_pin_memory=False, # Trainer automatically handles this for MPS
 )
 
 trainer = None
@@ -169,7 +180,7 @@ if len(tokenized_dataset["train"]) > 0:
         eval_dataset=tokenized_dataset["validation"] if len(tokenized_dataset["validation"]) > 0 else None,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
-        tokenizer=processor.tokenizer,
+        tokenizer=processor.tokenizer, # Still a FutureWarning, but not a blocking error
     )
 
 # --- 7. Start Training ---
