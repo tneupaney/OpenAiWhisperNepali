@@ -16,19 +16,19 @@ from typing import Any, Dict, List, Union
 script_dir = os.path.dirname(os.path.abspath(__file__))
 common_voice_dir = os.path.join(script_dir, "mozilla", "ne")
 audio_base_path = os.path.join(common_voice_dir, "clips")
-model_name = "openai/whisper-base" # CHANGED: Using a smaller model to reduce memory usage
+model_name = "openai/whisper-base" # Changed to 'base' for memory efficiency
 
 # --- 1. Load Pre-trained Whisper Model and Processor ---
 processor = WhisperProcessor.from_pretrained(model_name, language="ne", task="transcribe")
 model = WhisperForConditionalGeneration.from_pretrained(model_name)
 
-# Move model to MPS device for Apple Silicon acceleration if available
-if torch.backends.mps.is_available():
-    model = model.to("mps")
-    print("MPS is available. Model moved to MPS device for Apple Silicon acceleration.")
-elif torch.cuda.is_available(): # Fallback for NVIDIA CUDA, though unlikely on your Mac
+# Move model to GPU (CUDA or MPS) if available
+if torch.cuda.is_available():
     model = model.to("cuda")
     print("CUDA is available. Model moved to GPU.")
+elif torch.backends.mps.is_available():
+    model = model.to("mps")
+    print("MPS is available. Model moved to MPS device for Apple Silicon acceleration.")
 else:
     print("No GPU acceleration (CUDA/MPS) available. Model will run on CPU.")
 
@@ -47,7 +47,8 @@ try:
         data_files=data_files,
         delimiter="\t",
         column_names=["client_id", "path", "sentence_id", "sentence", "sentence_domain", "up_votes", "down_votes", "age", "gender", "accents", "variant", "locale", "segment"],
-        skiprows=1
+        skiprows=1,
+        cache_dir=None # ADDED: Disable caching for local files, crucial for Colab/Drive
     )
 except FileNotFoundError as e:
     print(f"Error: Could not find Common Voice TSV files. Details: {e}")
@@ -147,15 +148,15 @@ def compute_metrics(pred):
 # --- 6. Configure Training Arguments and Trainer ---
 training_args = Seq2SeqTrainingArguments(
     output_dir="./whisper-fine-tuned-nepali-cv",
-    per_device_train_batch_size=2, # Keep at 2 for now
-    gradient_accumulation_steps=8, # Keep at 8 for now
+    per_device_train_batch_size=2, # Reduced for memory
+    gradient_accumulation_steps=8, # Increased to maintain effective batch size
     learning_rate=1e-5,
     warmup_steps=500,
     max_steps=4000,
-    gradient_checkpointing=False, # Keep False
-    fp16=False, # Keep False
-    eval_strategy="steps",
-    per_device_eval_batch_size=2, # Keep at 2 for now
+    gradient_checkpointing=False, # Disabled to avoid graph issues on MPS
+    fp16=False, # Disabled as MPS does not support FP16 directly
+    eval_strategy="steps", # Corrected keyword
+    per_device_eval_batch_size=2, # Reduced for memory
     predict_with_generate=True,
     generation_max_length=225,
     save_steps=1000,
@@ -166,9 +167,6 @@ training_args = Seq2SeqTrainingArguments(
     metric_for_best_model="wer",
     greater_is_better=False,
     push_to_hub=False,
-    # Added to potentially help with MPS memory management, though often not needed
-    # when batch size is small enough.
-    # dataloader_pin_memory=False, # Trainer automatically handles this for MPS
 )
 
 trainer = None
@@ -180,7 +178,7 @@ if len(tokenized_dataset["train"]) > 0:
         eval_dataset=tokenized_dataset["validation"] if len(tokenized_dataset["validation"]) > 0 else None,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
-        tokenizer=processor.tokenizer, # Still a FutureWarning, but not a blocking error
+        tokenizer=processor.tokenizer, # FutureWarning: Use `processing_class` instead in v5.0.0
     )
 
 # --- 7. Start Training ---
