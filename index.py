@@ -1,8 +1,8 @@
 import os
 import torch
 import evaluate
-from datasets import load_dataset, Audio, Value, Dataset # Import Dataset
-import pandas as pd # Import pandas for manual TSV loading
+import csv # Import csv module for manual TSV reading
+from datasets import Audio, Value, Dataset, DatasetDict # Import Dataset and DatasetDict
 from transformers import (
     WhisperProcessor,
     WhisperForConditionalGeneration,
@@ -33,53 +33,52 @@ elif torch.backends.mps.is_available():
 else:
     print("No GPU acceleration (CUDA/MPS) available. Model will run on CPU.")
 
-# --- 2. Load Common Voice Dataset from Local TSV files (Manual Load) ---
+# --- 2. Load Common Voice Dataset from Local TSV files (Manual Load using csv module) ---
+
+# Define a function to load TSV into a list of dictionaries
+def load_tsv_to_list_of_dicts(filepath):
+    data = []
+    with open(filepath, 'r', encoding='utf-8') as f:
+        # Use csv.DictReader to automatically handle headers and create dictionaries
+        reader = csv.DictReader(f, delimiter='\t')
+        for row in reader:
+            data.append(row)
+    return data
+
 train_tsv_path = os.path.join(common_voice_dir, "train.tsv")
 dev_tsv_path = os.path.join(common_voice_dir, "dev.tsv")
 
 try:
-    # Manually read TSV files into pandas DataFrames
     print(f"Manually loading train.tsv from: {train_tsv_path}")
-    train_df = pd.read_csv(
-        train_tsv_path,
-        sep="\t",
-        header=0, # Use the first row as header
-        # Ensure column names match your TSV exactly, pandas will handle it
-    )
+    train_data_list = load_tsv_to_list_of_dicts(train_tsv_path)
     print(f"Manually loading dev.tsv from: {dev_tsv_path}")
-    dev_df = pd.read_csv(
-        dev_tsv_path,
-        sep="\t",
-        header=0, # Use the first row as header
-    )
+    dev_data_list = load_tsv_to_list_of_dicts(dev_tsv_path)
 
-    # Convert pandas DataFrames to datasets.Dataset objects
-    train_dataset = Dataset.from_pandas(train_df)
-    validation_dataset = Dataset.from_pandas(dev_df)
+    # Convert lists of dictionaries to datasets.Dataset objects
+    train_dataset = Dataset.from_list(train_data_list)
+    validation_dataset = Dataset.from_list(dev_data_list)
 
     # Re-assemble into a DatasetDict
-    from datasets import DatasetDict
     dataset = DatasetDict({
         "train": train_dataset,
         "validation": validation_dataset
     })
 
-    print("Dataset loaded successfully using pandas. Initial structure:")
+    print("Dataset loaded successfully using csv module. Initial structure:")
     print(dataset)
     print("Initial columns:", dataset["train"].column_names)
 
 except FileNotFoundError as e:
     print(f"Error: Could not find Common Voice TSV files. Please ensure the path '{common_voice_dir}' is correct and contains 'train.tsv' and 'dev.tsv'.")
     print(f"Details: {e}")
-    exit() # Exit the script if essential files are not found
+    exit()
 except Exception as e:
     print(f"An error occurred during manual dataset loading: {e}")
     exit()
 
 
 # --- Data Preprocessing: Filtering and Column Management ---
-# The column names will now be inferred directly from the TSV header by pandas.
-# We need to ensure 'sentence' and 'path' columns exist before casting/filtering.
+# The column names are now directly from the TSV header via csv.DictReader.
 
 # Explicitly cast the 'sentence' column to string type.
 print("Casting 'sentence' column to string type...")
@@ -141,7 +140,6 @@ for split in ["train", "validation"]:
         print(f"✅ Columns in {split} after adding 'audio_path':", dataset[split].column_names)
 
         # Define columns to remove, including the original 'path' and any internal index columns.
-        # Ensure that 'path' is in the columns before attempting to remove it.
         cols_to_remove = ["path"] + [col for col in dataset[split].column_names if col.startswith("__index_level_")]
         cols_to_remove_existing = [col for col in cols_to_remove if col in dataset[split].column_names]
 
